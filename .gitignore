@@ -1,0 +1,13 @@
+node_modules/
+dist/
+workers/node_modules/
+workers/dist/
+*.tgz
+.package-test-*/
+.dev.vars
+.env
+.env.*
+!.env.example
+.wrangler/
+.DS_Store
+coverage/

@@ -1,0 +1,25 @@
+name = "taskboi-mcp-template"
+main = "src/index.ts"
+compatibility_date = "2025-01-20"
+compatibility_flags = ["nodejs_compat"]
+
+[alias]
+zod = "./node_modules/zod/index.js"
+
+# Required operator bindings intentionally have no values in source control.
+# Configure TASKBOI_API_BASE_URL and OAUTH_ISSUER in your own Worker environment,
+# and configure OAUTH_ENCRYPTION_KEY as a Worker secret before deployment.
+# OAUTH_CLIENTS is an optional compatibility allowlist for clients with a prior
+# relationship.
+# OAUTH_CLIENT_METADATA_ALLOWED_ORIGINS is an optional plaintext JSON array of
+# exact HTTPS publisher origins; absent means URL client IDs are rejected.
+[[durable_objects.bindings]]
+name = "OAUTH_STORE"
+class_name = "OAuthStore"
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["OAuthStore"]
+
+[observability]
+enabled = true
