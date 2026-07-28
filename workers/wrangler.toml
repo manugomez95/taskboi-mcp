@@ -13,6 +13,8 @@ zod = "./node_modules/zod/index.js"
 # relationship.
 # OAUTH_CLIENT_METADATA_ALLOWED_ORIGINS is an optional plaintext JSON array of
 # exact HTTPS publisher origins; absent means URL client IDs are rejected.
+# MCP_ALLOWED_ORIGINS is an optional plaintext JSON array of exact canonical
+# HTTPS browser origins allowed to access /mcp; OAUTH_ISSUER is always allowed.
 [[durable_objects.bindings]]
 name = "OAUTH_STORE"
 class_name = "OAuthStore"

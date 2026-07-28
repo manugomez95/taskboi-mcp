@@ -26,6 +26,7 @@ export interface OAuthEnv {
   OAUTH_ENCRYPTION_KEY?: string;
   OAUTH_ISSUER?: string;
   OAUTH_CLIENT_METADATA_ALLOWED_ORIGINS?: string;
+  MCP_ALLOWED_ORIGINS?: string;
   OAUTH_STORE: DurableObjectNamespace;
 }
 
@@ -131,6 +132,30 @@ export function validateOAuthConfiguration(env: OAuthEnv): void {
   decodeEncryptionKey(env.OAUTH_ENCRYPTION_KEY);
   issuer(env.OAUTH_ISSUER);
   parseMetadataAllowedOrigins(env.OAUTH_CLIENT_METADATA_ALLOWED_ORIGINS);
+  parseMcpAllowedOrigins(env.MCP_ALLOWED_ORIGINS);
+}
+
+export function parseMcpAllowedOrigins(raw: string | undefined): Set<string> {
+  if (!raw) return new Set();
+  let parsed: unknown;
+  try { parsed = JSON.parse(raw); } catch { throw new Error("MCP_ALLOWED_ORIGINS must be valid JSON"); }
+  if (!Array.isArray(parsed) || parsed.length > 50) {
+    throw new Error("MCP_ALLOWED_ORIGINS must be an array of at most 50 origins");
+  }
+  const origins = parsed.map((value) => {
+    if (typeof value !== "string") throw new Error("Invalid MCP allowed origin");
+    let url: URL;
+    try { url = new URL(value); } catch { throw new Error("Invalid MCP allowed origin"); }
+    if (url.protocol !== "https:" || url.username || url.password ||
+        url.pathname !== "/" || url.search || url.hash || value !== url.origin) {
+      throw new Error("MCP allowed origins must be exact canonical HTTPS origins");
+    }
+    return url.origin;
+  });
+  if (new Set(origins).size !== origins.length) {
+    throw new Error("Duplicate MCP allowed origin");
+  }
+  return new Set(origins);
 }
 
 function parseMetadataAllowedOrigins(raw: string | undefined): Set<string> {

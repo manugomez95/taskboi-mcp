@@ -93,8 +93,10 @@ describe("hardened OAuth worker", () => {
     expect(() => validateOAuthConfiguration(configured)).toThrow(/OAUTH_ENCRYPTION_KEY/);
     expect(() => validateOAuthConfiguration({ ...configured, OAUTH_ENCRYPTION_KEY: "not-base64" })).toThrow(/exactly 32 bytes/);
     expect(() => validateOAuthConfiguration({ ...configured, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=" })).not.toThrow();
-    expect(() => validateOAuthConfiguration({ OAUTH_STORE: env.OAUTH_STORE, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", OAUTH_ISSUER: "https://issuer.example", TASKBOI_API_BASE_URL: env.TASKBOI_API_BASE_URL })).not.toThrow();
+    expect(() => validateOAuthConfiguration({ OAUTH_STORE: env.OAUTH_STORE, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", OAUTH_ISSUER: "https://issuer.example", TASKBOI_API_BASE_URL: env.TASKBOI_API_BASE_URL, MCP_ALLOWED_ORIGINS: "[\"https://app.example\"]" })).not.toThrow();
     expect(() => validateOAuthConfiguration({ ...configured, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", OAUTH_ISSUER: "https://issuer.example/path" })).toThrow(/origin/);
+    expect(() => validateOAuthConfiguration({ ...configured, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", MCP_ALLOWED_ORIGINS: "[\"*\"]" })).toThrow(/MCP allowed origin/);
+    expect(() => validateOAuthConfiguration({ ...configured, OAUTH_ENCRYPTION_KEY: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=", MCP_ALLOWED_ORIGINS: "[\"https://app.example/path\"]" })).toThrow(/exact canonical HTTPS origins/);
   });
 
   it("publishes RFC metadata and advertises protected-resource discovery on 401", async () => {
@@ -397,7 +399,14 @@ describe("hardened OAuth worker", () => {
     const tokenResponse = await exchange(await issueCode());
     const { access_token: token } = await tokenResponse.json<{ access_token: string }>();
     const mcpBody = JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" });
-    expect((await SELF.fetch("https://worker.test/mcp", { method: "POST", headers: { Authorization: `Bearer ${token}` }, body: mcpBody })).status).toBe(200);
+    expect((await SELF.fetch("https://worker.test/mcp", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "MCP-Protocol-Version": "2024-11-05",
+      },
+      body: mcpBody,
+    })).status).toBe(200);
     expect((await SELF.fetch("https://worker.test/mcp?key=tk_test_api_key", { method: "POST", body: mcpBody })).status).toBe(400);
 
     await SELF.fetch("https://worker.test/revoke", {

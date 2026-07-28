@@ -2,6 +2,11 @@
 
 import {
   handleTaskboiMcpRequest,
+  HANDSHAKE_PROTOCOL_VERSION,
+  LEGACY_PROTOCOL_VERSION,
+  MODERN_PROTOCOL_VERSION,
+  SUPPORTED_PROTOCOL_VERSIONS,
+  type SupportedProtocolVersion,
   type TaskboiOperations,
 } from "./protocol";
 import { TaskboiApiClient } from "./api-client";
@@ -9,6 +14,7 @@ import {
   handleOAuth,
   OAuthStore,
   resolveAccessToken,
+  parseMcpAllowedOrigins,
   validateOAuthConfiguration,
   type OAuthEnv,
 } from "./oauth";
@@ -32,19 +38,27 @@ const defaultDependencies: WorkerDependencies = {
     new TaskboiApiClient(apiKey, env.TASKBOI_API_BASE_URL!),
 };
 
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
+const responseHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+  "Access-Control-Allow-Headers":
+    "Content-Type, Authorization, MCP-Protocol-Version, Mcp-Method, Mcp-Name",
   "Cache-Control": "no-store",
   "X-Content-Type-Options": "nosniff",
   "X-Frame-Options": "DENY",
 };
 
+function headersFor(origin?: string): Record<string, string> {
+  return origin
+    ? { ...responseHeaders, "Access-Control-Allow-Origin": origin, Vary: "Origin" }
+    : responseHeaders;
+}
+
 export function createWorker(dependencies: WorkerDependencies = defaultDependencies) {
   return {
     async fetch(request: Request, env: Env): Promise<Response> {
       const url = new URL(request.url);
+      const origin = request.headers.get("Origin");
+      let allowedOrigin: string | undefined;
 
       try {
         dependencies.validateConfiguration(env);
@@ -55,9 +69,30 @@ export function createWorker(dependencies: WorkerDependencies = defaultDependenc
         );
         return Response.json(
           { error: "server_error" },
-          { status: 500, headers: corsHeaders },
+          { status: 500, headers: responseHeaders },
         );
       }
+
+      if (url.pathname === "/mcp" && origin !== null) {
+        let configuredOrigins: Set<string>;
+        try {
+          configuredOrigins = parseMcpAllowedOrigins(env.MCP_ALLOWED_ORIGINS);
+          if (env.OAUTH_ISSUER) configuredOrigins.add(new URL(env.OAUTH_ISSUER).origin);
+        } catch {
+          return Response.json(
+            { jsonrpc: "2.0", error: { code: -32000, message: "Invalid Origin" } },
+            { status: 403, headers: responseHeaders },
+          );
+        }
+        if (!configuredOrigins.has(origin)) {
+          return Response.json(
+            { jsonrpc: "2.0", error: { code: -32000, message: "Invalid Origin" } },
+            { status: 403, headers: responseHeaders },
+          );
+        }
+        allowedOrigin = origin;
+      }
+      const corsHeaders = headersFor(allowedOrigin);
 
       if (request.method === "OPTIONS") {
         return new Response(null, { headers: corsHeaders });
@@ -125,14 +160,125 @@ export function createWorker(dependencies: WorkerDependencies = defaultDependenc
 
         try {
           const body: unknown = await request.json();
+          const protocolVersion = request.headers.get("MCP-Protocol-Version");
+          const value = body && typeof body === "object"
+            ? body as {
+              id?: number | string;
+              method?: unknown;
+              params?: { name?: unknown; uri?: unknown; _meta?: Record<string, unknown> };
+            }
+            : {};
+          const error = (
+            code: number,
+            message: string,
+            status = 400,
+            data?: Record<string, unknown>,
+          ) =>
+            Response.json(
+              {
+                jsonrpc: "2.0",
+                ...(value.id !== undefined ? { id: value.id } : {}),
+                error: { code, message, ...(data ? { data } : {}) },
+              },
+              { status, headers: corsHeaders },
+            );
+
+          if (protocolVersion === HANDSHAKE_PROTOCOL_VERSION ||
+              protocolVersion === LEGACY_PROTOCOL_VERSION) {
+            const response = await handleTaskboiMcpRequest(
+              body,
+              dependencies.operations(authorization.apiKey, env),
+              protocolVersion as SupportedProtocolVersion,
+            );
+            if (response === null) {
+              return new Response(null, { status: 202, headers: corsHeaders });
+            }
+            return Response.json(response, { headers: corsHeaders });
+          }
+
+          if (protocolVersion !== MODERN_PROTOCOL_VERSION) {
+            if (protocolVersion === null) {
+              return error(-32020, "Header mismatch: MCP-Protocol-Version header is required");
+            }
+            return error(
+              -32022,
+              "Unsupported protocol version",
+              400,
+              {
+                supported: [...SUPPORTED_PROTOCOL_VERSIONS],
+                requested: protocolVersion,
+              },
+            );
+          }
+
+          const bodyVersion =
+            value.params?._meta?.["io.modelcontextprotocol/protocolVersion"];
+          if (bodyVersion !== MODERN_PROTOCOL_VERSION) {
+            return error(
+              -32020,
+              "Header mismatch: MCP-Protocol-Version header does not match request _meta",
+            );
+          }
+          if (typeof value.method !== "string") {
+            return error(-32020, "Header mismatch: request method is missing");
+          }
+          const methodHeader = request.headers.get("Mcp-Method");
+          if (methodHeader !== value.method) {
+            return error(
+              -32020,
+              methodHeader === null
+                ? "Header mismatch: Mcp-Method header is required"
+                : "Header mismatch: Mcp-Method header does not match request method",
+            );
+          }
+
+          const nameSource = value.method === "resources/read"
+            ? value.params?.uri
+            : ["tools/call", "prompts/get"].includes(value.method)
+              ? value.params?.name
+              : undefined;
+          if (nameSource !== undefined) {
+            const nameHeader = request.headers.get("Mcp-Name");
+            if (nameHeader === null) {
+              return error(-32020, "Header mismatch: Mcp-Name header is required");
+            }
+            let decodedName = nameHeader;
+            if (nameHeader.startsWith("=?base64?") && nameHeader.endsWith("?=")) {
+              try {
+                const encoded = nameHeader.slice(9, -2);
+                const bytes = Uint8Array.from(atob(encoded), (character) =>
+                  character.charCodeAt(0));
+                decodedName = new TextDecoder("utf-8", {
+                  fatal: true,
+                  ignoreBOM: false,
+                }).decode(bytes);
+              } catch {
+                return error(-32020, "Header mismatch: Mcp-Name header is malformed");
+              }
+            }
+            if (typeof nameSource !== "string" || decodedName !== nameSource) {
+              return error(
+                -32020,
+                "Header mismatch: Mcp-Name header does not match request name",
+              );
+            }
+          } else if (request.headers.has("Mcp-Name")) {
+            return error(
+              -32020,
+              "Header mismatch: Mcp-Name header has no corresponding request name",
+            );
+          }
+
           const response = await handleTaskboiMcpRequest(
             body,
             dependencies.operations(authorization.apiKey, env),
+            MODERN_PROTOCOL_VERSION,
           );
           if (response === null) {
             return new Response(null, { status: 202, headers: corsHeaders });
           }
-          return Response.json(response, { headers: corsHeaders });
+          const status = response.error?.code === -32601 ? 404 : 200;
+          return Response.json(response, { status, headers: corsHeaders });
         } catch {
           return Response.json(
             {
