@@ -54,6 +54,7 @@ async function issueCode(): Promise<string> {
   const location = new URL(response.headers.get("location")!);
   expect(location.origin + location.pathname).toBe(redirectUri);
   expect(location.searchParams.get("state")).toBe("round-trip");
+  expect(location.searchParams.get("iss")).toBe("https://worker.test");
   return location.searchParams.get("code")!;
 }
 
@@ -107,6 +108,39 @@ describe("hardened OAuth worker", () => {
     expect(server.code_challenge_methods_supported).toEqual(["S256"]);
     const unauthorized = await SELF.fetch("https://worker.test/mcp", { method: "POST", body: "{}" });
     expect(unauthorized.headers.get("www-authenticate")).toBe('Bearer resource_metadata="https://worker.test/.well-known/oauth-protected-resource/mcp", scope="mcp"');
+  });
+
+  it("returns the validated canonical issuer on successful authorization despite a spoofed inbound host", async () => {
+    const state = "issuer-mix-up-state";
+    const form = new URLSearchParams({
+      response_type: "code",
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      state,
+      code_challenge: await challenge(),
+      code_challenge_method: "S256",
+      scope: "mcp",
+      resource: "https://worker.test/mcp",
+      api_key: "tk_test_api_key",
+    });
+    const response = await handleOAuth(new Request("https://attacker.example/authorize/submit", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "CF-Connecting-IP": `192.0.2.${nextIssueIp++}`,
+        Host: "spoofed-host.example",
+      },
+      body: form,
+    }), env);
+
+    expect(response?.status).toBe(302);
+    const callback = new URL(response!.headers.get("location")!);
+    expect(callback.origin + callback.pathname).toBe(redirectUri);
+    expect(callback.searchParams.get("code")).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(callback.searchParams.get("state")).toBe(state);
+    expect(callback.searchParams.get("iss")).toBe("https://worker.test");
+    expect(callback.searchParams.get("iss")).not.toBe("https://attacker.example");
+    expect(callback.searchParams.get("iss")).not.toBe("https://spoofed-host.example");
   });
 
   it("resolves valid HTTPS client metadata and rejects unsafe or mismatched documents", async () => {
@@ -237,6 +271,7 @@ describe("hardened OAuth worker", () => {
     expect(callback.origin + callback.pathname).toBe(loopback);
     expect(callback.searchParams.get("code")).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(callback.searchParams.get("state")).toBe("hermes-state");
+    expect(callback.searchParams.get("iss")).toBe("https://worker.test");
   });
 
   it("rejects registration metadata with an unsupported grant", async () => {

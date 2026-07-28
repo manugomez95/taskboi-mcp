@@ -52,6 +52,14 @@ clients remain valid. Other origins fail closed with HTTP 403; wildcards, paths,
 queries, fragments, credentials, duplicates, non-HTTPS origins, and more than
 50 entries are rejected. Binding values are never logged.
 
+Client interoperability is CIMD-first: prefer a URL-based Client ID Metadata
+Document for clients whose publisher origin the operator has explicitly
+allowlisted. Dynamic Client Registration remains available as a compatibility
+path for clients that do not support CIMD, subject to its existing registration
+rate limit, global capacity, and 30-day expiry. Static client configuration
+remains suitable for operator-managed clients. The Worker does not automatically
+allow CIMD origins or convert registrations between these mechanisms.
+
 Generate `OAUTH_ENCRYPTION_KEY` without printing it and store it as a Cloudflare
 secret:
 
@@ -112,7 +120,17 @@ it directly as the MCP bearer token.
 Authorization codes expire after five minutes and access tokens after one hour.
 Authorization and token requests require exactly one `resource` value equal to
 `${OAUTH_ISSUER}/mcp`. HTTPS redirect URIs are required except for loopback
-native-development redirects on `localhost` or `127.0.0.1`.
+native-development redirects on `localhost` or `127.0.0.1`. Successful
+authorization redirects contain `code`, preserve the request's `state` when
+present, and include RFC 9207 `iss` set to the validated canonical
+`OAUTH_ISSUER`; request URL and Host values are not issuer sources.
+
+For observability, operators may use their platform's aggregate request metrics
+to monitor endpoint status-code rates and latency, especially CIMD authorization
+failures and `/register` responses such as `429` and `503`. Do not log request
+bodies, query strings, form fields, authorization codes, access tokens, Taskboi
+API keys, client metadata documents, or full redirect URIs. This project does
+not define an additional logging or metrics binding.
 
 ## MCP protocol compatibility
 

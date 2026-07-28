@@ -442,6 +442,7 @@ export async function handleOAuth(request: Request, env: OAuthEnv): Promise<Resp
     const redirect = new URL(parsed.redirectUri);
     redirect.searchParams.set("code", code);
     if (parsed.state) redirect.searchParams.set("state", parsed.state);
+    redirect.searchParams.set("iss", base);
     return new Response(null, { status: 302, headers: { Location: redirect.toString(), "Cache-Control": "no-store", ...securityHeaders } });
   }
   if (url.pathname === "/token" && request.method === "POST") {
