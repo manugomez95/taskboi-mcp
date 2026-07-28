@@ -45,6 +45,13 @@ canonical HTTPS publisher origins. When absent or empty, URL-based client ID
 metadata documents are rejected. Dynamic registration and static clients remain
 available. Do not copy a hosted service's allowlist into a self-hosted instance.
 
+Optional `MCP_ALLOWED_ORIGINS` is a JSON array of exact canonical HTTPS origins
+allowed to make browser requests to `/mcp`. The configured `OAUTH_ISSUER` origin
+is always allowed. When the request has no `Origin` header, native and CLI
+clients remain valid. Other origins fail closed with HTTP 403; wildcards, paths,
+queries, fragments, credentials, duplicates, non-HTTPS origins, and more than
+50 entries are rejected. Binding values are never logged.
+
 Generate `OAUTH_ENCRYPTION_KEY` without printing it and store it as a Cloudflare
 secret:
 
@@ -106,6 +113,20 @@ Authorization codes expire after five minutes and access tokens after one hour.
 Authorization and token requests require exactly one `resource` value equal to
 `${OAUTH_ISSUER}/mcp`. HTTPS redirect URIs are required except for loopback
 native-development redirects on `localhost` or `127.0.0.1`.
+
+## MCP protocol compatibility
+
+The remote endpoint supports the stateless MCP `2026-07-28` transport. Each
+modern POST must include matching `MCP-Protocol-Version` and `Mcp-Method`
+headers, plus `Mcp-Name` for `tools/call`; the protocol version must also appear
+in the request `params._meta`. `server/discover`, `tools/list`, and `tools/call`
+are authenticated and do not require an `initialize` exchange.
+
+For migration, handshake-era behavior remains available when a client explicitly
+sends `MCP-Protocol-Version: 2025-11-25`; deployed `2024-11-05` compatibility is
+also retained. The `initialize` result agrees with the selected header version.
+Headerless requests are rejected. These compatibility paths are deprecated and
+may be removed in a future release; no retirement date has been set.
 
 The binding comparator in [`scripts/`](scripts/) is a reusable, value-suppressing
 operator helper. It compares binding metadata without comparing secret values;

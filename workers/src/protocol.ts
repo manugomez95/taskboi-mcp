@@ -303,7 +303,31 @@ export interface TaskboiJsonRpcResponse {
   jsonrpc: "2.0";
   id?: number | string;
   result?: unknown;
-  error?: { code: number; message: string };
+  error?: { code: number; message: string; data?: JsonObject };
+}
+
+export const MODERN_PROTOCOL_VERSION = "2026-07-28";
+export const HANDSHAKE_PROTOCOL_VERSION = "2025-11-25";
+export const LEGACY_PROTOCOL_VERSION = "2024-11-05";
+export const SUPPORTED_PROTOCOL_VERSIONS = [
+  MODERN_PROTOCOL_VERSION,
+  HANDSHAKE_PROTOCOL_VERSION,
+  LEGACY_PROTOCOL_VERSION,
+] as const;
+export type SupportedProtocolVersion = typeof SUPPORTED_PROTOCOL_VERSIONS[number];
+const STATIC_RESULT_TTL_MS = 300_000;
+
+const serverInfo = { name: "Taskboi", version: "1.0.0" };
+const serverMeta = {
+  "io.modelcontextprotocol/serverInfo": serverInfo,
+};
+
+function modernResult(result: JsonObject): JsonObject {
+  return {
+    resultType: "complete",
+    ...result,
+    _meta: serverMeta,
+  };
 }
 
 /**
@@ -313,6 +337,8 @@ export interface TaskboiJsonRpcResponse {
 export async function handleTaskboiMcpRequest(
   request: unknown,
   operations: TaskboiOperations,
+  protocolVersion: SupportedProtocolVersion =
+    LEGACY_PROTOCOL_VERSION,
 ): Promise<TaskboiJsonRpcResponse | null> {
   const value = request && typeof request === "object"
     ? request as { method?: unknown; params?: unknown; id?: number | string }
@@ -324,18 +350,53 @@ export async function handleTaskboiMcpRequest(
   const id = value.id;
 
   switch (value.method) {
+    case "server/discover":
+      if (protocolVersion !== MODERN_PROTOCOL_VERSION) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: "Method not found" },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: modernResult({
+          supportedVersions: [...SUPPORTED_PROTOCOL_VERSIONS],
+          capabilities: { tools: {} },
+          ttlMs: STATIC_RESULT_TTL_MS,
+          cacheScope: "public",
+        }),
+      };
     case "initialize":
+      if (protocolVersion === MODERN_PROTOCOL_VERSION) {
+        return {
+          jsonrpc: "2.0",
+          id,
+          error: { code: -32601, message: "Method not found" },
+        };
+      }
       return {
         jsonrpc: "2.0",
         id,
         result: {
-          protocolVersion: "2024-11-05",
+          protocolVersion,
           capabilities: { tools: {} },
-          serverInfo: { name: "Taskboi", version: "1.0.0" },
+          serverInfo,
         },
       };
     case "tools/list":
-      return { jsonrpc: "2.0", id, result: { tools: taskboiTools } };
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: protocolVersion === MODERN_PROTOCOL_VERSION
+          ? modernResult({
+            tools: taskboiTools,
+            ttlMs: STATIC_RESULT_TTL_MS,
+            cacheScope: "public",
+          })
+          : { tools: taskboiTools },
+      };
     case "tools/call": {
       const parsed = callToolRequest.safeParse(value);
       if (!parsed.success) {
@@ -348,11 +409,17 @@ export async function handleTaskboiMcpRequest(
       return {
         jsonrpc: "2.0",
         id,
-        result: await dispatchTaskboiTool(
+        result: protocolVersion === MODERN_PROTOCOL_VERSION
+          ? modernResult(await dispatchTaskboiTool(
+            parsed.data.params.name,
+            parsed.data.params.arguments,
+            operations,
+          ))
+          : await dispatchTaskboiTool(
           parsed.data.params.name,
           parsed.data.params.arguments,
           operations,
-        ),
+          ),
       };
     }
     default:
