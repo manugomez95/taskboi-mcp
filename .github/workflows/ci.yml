@@ -17,10 +17,8 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run build
-      - run: npm test
-      - run: npm audit --omit=dev --audit-level=high
-      - run: node scripts/check-workflow-policy.mjs
+      - run: npm run check:stdio
+      - run: npm run check:workflows
 
   worker:
     runs-on: ubuntu-latest
@@ -35,10 +33,7 @@ jobs:
           cache: npm
           cache-dependency-path: workers/package-lock.json
       - run: npm ci
-      - run: npm test
-      - run: npm run typecheck
-      - run: npm run build
-      - run: npm audit --omit=dev --audit-level=high
+      - run: npm run check
 
   secrets:
     runs-on: ubuntu-latest

@@ -26,6 +26,9 @@
     "start": "node dist/index.js",
     "dev": "tsc --watch",
     "test": "npm run build && node --test test/*.test.js",
+    "check": "npm run check:stdio && npm --prefix workers run check && npm run check:workflows",
+    "check:stdio": "npm test && npm audit --omit=dev --audit-level=high",
+    "check:workflows": "node scripts/check-workflow-policy.mjs",
     "verify:package": "node --test test/package-contents.test.js"
   },
   "keywords": [
