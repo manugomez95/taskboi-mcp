@@ -4,29 +4,21 @@ Thanks for helping improve the public Taskboi MCP integration.
 
 ## Development setup
 
-Use Node.js 18 or later. Install and verify the stdio package from the repository
-root:
+Use Node.js 18 or later. Install both packages, then run the canonical
+technical-health check from the repository root:
 
 ```sh
 npm ci
-npm run build
-npm test
-npm audit --omit=dev --audit-level=high
+npm --prefix workers ci
+npm run check
 ```
 
-Verify the remote Worker separately:
-
-```sh
-cd workers
-npm ci
-npm test
-npm run typecheck
-npm run build
-npm audit --omit=dev --audit-level=high
-```
-
-The Worker build is a local Wrangler dry run. Repository automation never
-publishes the npm package, creates release assets, or deploys a Worker.
+The check covers stdio and Worker tests and builds, Worker type-checking,
+production dependency audits, and workflow policy. The Worker build is a local
+Wrangler dry run. The current toolchain has no robust unused-dependency
+analysis, so review suspected unused dependencies manually rather than relying
+on this command to detect them. Repository automation never publishes the npm
+package, creates release assets, or deploys a Worker.
 
 ## Pull requests
 

@@ -81,21 +81,22 @@ Task recurrence uses RRULE strings such as `FREQ=DAILY`,
 
 ## Development
 
+Install both packages, then run the canonical repository technical-health check
+from the repository root:
+
 ```sh
 npm ci
-npm test
-npm audit --omit=dev --audit-level=high
-
-cd workers
-npm ci
-npm test
-npm run typecheck
-npm run build
-npm audit --omit=dev --audit-level=high
+npm --prefix workers ci
+npm run check
 ```
 
-The Worker build is a dry run and writes only ignored local output. Generated
-builds, bundles, tarballs, and credentials must not be committed. See
+`npm run check` tests and builds the stdio server, tests, type-checks, and
+dry-run builds the Worker, audits both production dependency trees at high
+severity, and enforces the workflow policy. The Worker build writes only
+ignored local output. The current toolchain does not provide robust
+unused-dependency analysis, so this check does not claim to detect unused
+dependencies; dependency removals require targeted review and validation.
+Generated builds, bundles, tarballs, and credentials must not be committed. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) and [`SECURITY.md`](SECURITY.md).
 
 ## License
