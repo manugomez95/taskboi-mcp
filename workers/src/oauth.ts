@@ -2,6 +2,7 @@ import { apiRequestUrl, normalizeTaskboiApiBaseUrl } from "./api-base-url";
 
 const CODE_TTL_SECONDS = 300;
 export const TOKEN_TTL_SECONDS = 3600;
+export const REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const MAX_BODY_BYTES = 16_384;
 const MAX_METADATA_BYTES = 16_384;
 const MAX_REDIRECT_URIS = 10;
@@ -52,7 +53,19 @@ interface TokenRecord {
   scope: string;
   resource: string;
   expiresAt: number;
+  grantId?: string;
   revoked: boolean;
+}
+
+type RefreshTokenRecord = Omit<TokenRecord, "revoked" | "grantId"> & { grantId: string };
+
+interface GrantRecord {
+  expiresAt: number;
+}
+
+interface GrantMembersRecord {
+  expiresAt: number;
+  members: Record<string, number>;
 }
 
 interface EncryptedValue { iv: string; ciphertext: string }
@@ -92,6 +105,13 @@ function requiredString(value: unknown, max: number): string | null {
 function unique(values: Parameters, name: string): string | null {
   const entries = values.getAll(name);
   return entries.length === 1 && isString(entries[0]) ? entries[0] : null;
+}
+
+function hasExactFormFields(values: Parameters, required: readonly string[], optional: readonly string[] = []): boolean {
+  const allowedSet = new Set([...required, ...optional]);
+  const names = [...new Set(values.keys())];
+  return names.every((name) => allowedSet.has(name)) && required.every((name) => names.includes(name)) &&
+    names.every((name) => values.getAll(name).length === 1);
 }
 
 function parseClients(raw: string | undefined): OAuthClientConfig[] {
@@ -401,7 +421,7 @@ export async function handleOAuth(request: Request, env: OAuthEnv): Promise<Resp
     return json({ resource: `${base}/mcp`, authorization_servers: [base], scopes_supported: [ALLOWED_SCOPE] }, 200, { "Cache-Control": "public, max-age=3600" });
   }
   if (url.pathname === "/.well-known/oauth-authorization-server" && request.method === "GET") {
-    return json({ issuer: base, authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`, registration_endpoint: `${base}/register`, response_types_supported: ["code"], grant_types_supported: ["authorization_code"], code_challenge_methods_supported: ["S256"], scopes_supported: [ALLOWED_SCOPE], token_endpoint_auth_methods_supported: ["none"], client_id_metadata_document_supported: true }, 200, { "Cache-Control": "public, max-age=3600" });
+    return json({ issuer: base, authorization_endpoint: `${base}/authorize`, token_endpoint: `${base}/token`, registration_endpoint: `${base}/register`, revocation_endpoint: `${base}/revoke`, response_types_supported: ["code"], grant_types_supported: ["authorization_code", "refresh_token"], code_challenge_methods_supported: ["S256"], scopes_supported: [ALLOWED_SCOPE], token_endpoint_auth_methods_supported: ["none"], client_id_metadata_document_supported: true }, 200, { "Cache-Control": "public, max-age=3600" });
   }
   if (url.pathname === "/register" && request.method === "POST") {
     const limited = await registrationRateLimit(request, env); if (limited) return limited;
@@ -417,7 +437,7 @@ export async function handleOAuth(request: Request, env: OAuthEnv): Promise<Resp
     const saved = await store(env).fetch("https://oauth.internal/register", { method: "POST", body: JSON.stringify({ ...client, expiresAt }) });
     if (saved.status === 429) return oauthError("server_error", "Client registration capacity is temporarily exhausted", 503);
     if (!saved.ok) return oauthError("server_error", "Client registration failed", 500);
-    return json({ client_id: client.client_id, client_id_issued_at: issuedAt, registration_expires_at: Math.floor(expiresAt / 1000), ...(data.client_name === undefined ? {} : { client_name: data.client_name }), redirect_uris: client.redirect_uris, token_endpoint_auth_method: "none", grant_types: ["authorization_code"], response_types: ["code"], scope: ALLOWED_SCOPE }, 201);
+    return json({ client_id: client.client_id, client_id_issued_at: issuedAt, registration_expires_at: Math.floor(expiresAt / 1000), ...(data.client_name === undefined ? {} : { client_name: data.client_name }), redirect_uris: client.redirect_uris, token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], scope: ALLOWED_SCOPE }, 201);
   }
   if (url.pathname === "/authorize" && request.method === "GET") {
     const parsed = await parseAuthorization(url.searchParams, env);
@@ -449,16 +469,30 @@ export async function handleOAuth(request: Request, env: OAuthEnv): Promise<Resp
     const form = await readForm(request);
     if (form instanceof Response) return form;
     const grantType = requiredString(unique(form, "grant_type"), 32);
-    const code = requiredString(unique(form, "code"), 256);
-    const verifier = requiredString(unique(form, "code_verifier"), 128);
-    const clientId = requiredString(unique(form, "client_id"), 2048);
-    const redirectUri = requiredString(unique(form, "redirect_uri"), 2048);
-    const resource = requiredString(unique(form, "resource"), 2048);
-    if (grantType !== "authorization_code") return oauthError("unsupported_grant_type", "Only authorization_code is supported");
-    if (!code || !OPAQUE_PATTERN.test(code) || !verifier || !PKCE_VERIFIER_PATTERN.test(verifier) || !clientId || !redirectUri || resource !== `${base}/mcp`) return oauthError("invalid_grant", "Invalid authorization code request");
-    const result = await store(env).fetch("https://oauth.internal/exchange", { method: "POST", body: JSON.stringify({ code, verifier, clientId, redirectUri, resource }) });
-    if (!result.ok) return oauthError("invalid_grant", "Code expired, already used, mismatched, or PKCE verification failed");
-    return json(await result.json());
+    if (!grantType) return oauthError("invalid_request", "Exactly one grant_type is required");
+    if (grantType === "authorization_code") {
+      if (!hasExactFormFields(form, ["grant_type", "code", "code_verifier", "client_id", "redirect_uri", "resource"])) return oauthError("invalid_request", "Invalid authorization code parameters");
+      const code = requiredString(unique(form, "code"), 256);
+      const verifier = requiredString(unique(form, "code_verifier"), 128);
+      const clientId = requiredString(unique(form, "client_id"), 2048);
+      const redirectUri = requiredString(unique(form, "redirect_uri"), 2048);
+      const resource = requiredString(unique(form, "resource"), 2048);
+      if (!code || !OPAQUE_PATTERN.test(code) || !verifier || !PKCE_VERIFIER_PATTERN.test(verifier) || !clientId || !redirectUri || resource !== `${base}/mcp`) return oauthError("invalid_grant", "Invalid authorization code request");
+      const result = await store(env).fetch("https://oauth.internal/exchange", { method: "POST", body: JSON.stringify({ code, verifier, clientId, redirectUri, resource }) });
+      if (!result.ok) return oauthError("invalid_grant", "Code expired, already used, mismatched, or PKCE verification failed");
+      return json(await result.json());
+    }
+    if (grantType === "refresh_token") {
+      if (!hasExactFormFields(form, ["grant_type", "refresh_token", "client_id"], ["resource"])) return oauthError("invalid_request", "Invalid refresh token parameters");
+      const refreshToken = requiredString(unique(form, "refresh_token"), 256);
+      const clientId = requiredString(unique(form, "client_id"), 2048);
+      const resource = form.has("resource") ? requiredString(unique(form, "resource"), 2048) : undefined;
+      if (!refreshToken || !OPAQUE_PATTERN.test(refreshToken) || !clientId || resource === null || (resource !== undefined && resource !== `${base}/mcp`)) return oauthError("invalid_grant", "Invalid refresh token request");
+      const result = await store(env).fetch("https://oauth.internal/refresh", { method: "POST", body: JSON.stringify({ refreshToken, clientId, resource }) });
+      if (!result.ok) return oauthError("invalid_grant", "Refresh token expired, revoked, already used, or mismatched");
+      return json(await result.json());
+    }
+    return oauthError("unsupported_grant_type", "Supported grant types are authorization_code and refresh_token");
   }
   if (url.pathname === "/revoke" && request.method === "POST") {
     const form = await readForm(request);
@@ -546,18 +580,63 @@ export class OAuthStore implements DurableObject {
         }
         if (code.clientId !== input.clientId || code.redirectUri !== input.redirectUri || code.resource !== input.resource || code.codeChallenge !== verifierHash) return null;
         await txn.delete([codeKey, this.expiryKey(code.expiresAt, codeKey)]);
+        const now = Date.now();
         const rawToken = randomToken(32);
+        const rawRefreshToken = randomToken(32);
+        const grantId = randomToken(32);
         const tokenKey = `token:${await sha256(rawToken)}`;
-        const token: TokenRecord = { apiKey: code.apiKey, clientId: code.clientId, scope: code.scope, resource: code.resource, expiresAt: Date.now() + TOKEN_TTL_SECONDS * 1000, revoked: false };
-        await txn.put({ [tokenKey]: token, [this.expiryKey(token.expiresAt, tokenKey)]: tokenKey });
-        return { access_token: rawToken, token_type: "Bearer", expires_in: TOKEN_TTL_SECONDS, scope: token.scope };
+        const refreshKey = `refresh:${await sha256(rawRefreshToken)}`;
+        const grantKey = `grant:${grantId}`;
+        const absoluteExpiresAt = now + REFRESH_TOKEN_TTL_SECONDS * 1000;
+        const token: TokenRecord = { apiKey: code.apiKey, clientId: code.clientId, scope: code.scope, resource: code.resource, expiresAt: now + TOKEN_TTL_SECONDS * 1000, grantId, revoked: false };
+        const refresh: RefreshTokenRecord = { apiKey: code.apiKey, clientId: code.clientId, scope: code.scope, resource: code.resource, expiresAt: absoluteExpiresAt, grantId };
+        const grant: GrantRecord = { expiresAt: absoluteExpiresAt };
+        const membersKey = `grant-members:${grantId}`;
+        const members: GrantMembersRecord = { expiresAt: absoluteExpiresAt, members: { [tokenKey]: token.expiresAt, [refreshKey]: refresh.expiresAt } };
+        await txn.put({ [tokenKey]: token, [this.expiryKey(token.expiresAt, tokenKey)]: tokenKey, [refreshKey]: refresh, [this.expiryKey(refresh.expiresAt, refreshKey)]: refreshKey, [grantKey]: grant, [this.expiryKey(grant.expiresAt, grantKey)]: grantKey, [membersKey]: members });
+        return { access_token: rawToken, refresh_token: rawRefreshToken, token_type: "Bearer", expires_in: TOKEN_TTL_SECONDS, scope: token.scope };
+      });
+      await this.scheduleCleanup();
+      return issued ? json(issued) : new Response(null, { status: 400 });
+    }
+    if (path === "/refresh") {
+      const input = await request.json<{ refreshToken: string; clientId: string; resource?: string }>();
+      const oldKey = `refresh:${await sha256(input.refreshToken)}`;
+      const issued = await this.state.storage.transaction(async (txn) => {
+        const old = await txn.get<RefreshTokenRecord>(oldKey);
+        if (!old) return null;
+        const now = Date.now();
+        const grantKey = `grant:${old.grantId}`;
+        const membersKey = `grant-members:${old.grantId}`;
+        const [grant, members] = await Promise.all([txn.get<GrantRecord>(grantKey), txn.get<GrantMembersRecord>(membersKey)]);
+        if (!grant || !members || old.expiresAt <= now || grant.expiresAt <= now) {
+          await txn.delete([oldKey, this.expiryKey(old.expiresAt, oldKey)]);
+          return null;
+        }
+        if (old.clientId !== input.clientId || (input.resource !== undefined && old.resource !== input.resource) || !old.scope.split(" ").includes(ALLOWED_SCOPE)) return null;
+        const rawToken = randomToken(32);
+        const rawRefreshToken = randomToken(32);
+        const tokenKey = `token:${await sha256(rawToken)}`;
+        const refreshKey = `refresh:${await sha256(rawRefreshToken)}`;
+        const token: TokenRecord = { apiKey: old.apiKey, clientId: old.clientId, scope: old.scope, resource: old.resource, expiresAt: Math.min(now + TOKEN_TTL_SECONDS * 1000, grant.expiresAt), grantId: old.grantId, revoked: false };
+        const refresh: RefreshTokenRecord = { apiKey: old.apiKey, clientId: old.clientId, scope: old.scope, resource: old.resource, expiresAt: grant.expiresAt, grantId: old.grantId };
+        await txn.delete([oldKey, this.expiryKey(old.expiresAt, oldKey)]);
+        delete members.members[oldKey];
+        members.members[tokenKey] = token.expiresAt;
+        members.members[refreshKey] = refresh.expiresAt;
+        await txn.put({ [tokenKey]: token, [this.expiryKey(token.expiresAt, tokenKey)]: tokenKey, [refreshKey]: refresh, [this.expiryKey(refresh.expiresAt, refreshKey)]: refreshKey, [membersKey]: members });
+        return { access_token: rawToken, refresh_token: rawRefreshToken, token_type: "Bearer", expires_in: Math.floor((token.expiresAt - now) / 1000), scope: token.scope };
       });
       await this.scheduleCleanup();
       return issued ? json(issued) : new Response(null, { status: 400 });
     }
     if (path === "/introspect") {
       const key = `token:${await sha256(await request.text())}`;
-      const token = await this.state.storage.get<TokenRecord>(key);
+      const token = await this.state.storage.transaction(async (txn) => {
+        const candidate = await txn.get<TokenRecord>(key);
+        if (!candidate || (candidate.grantId !== undefined && !await txn.get<GrantRecord>(`grant:${candidate.grantId}`))) return null;
+        return candidate;
+      });
       if (!token || token.revoked || !token.scope.split(" ").includes(ALLOWED_SCOPE)) return new Response(null, { status: 401 });
       if (token.expiresAt <= Date.now()) {
         await this.state.storage.delete([key, this.expiryKey(token.expiresAt, key)]);
@@ -567,10 +646,27 @@ export class OAuthStore implements DurableObject {
       return json({ apiKey: await this.decrypt(token.apiKey), scope: token.scope, resource: token.resource });
     }
     if (path === "/revoke") {
-      const key = `token:${await sha256(await request.text())}`;
+      const hash = await sha256(await request.text());
+      const accessKey = `token:${hash}`;
+      const refreshKey = `refresh:${hash}`;
       await this.state.storage.transaction(async (txn) => {
-        const token = await txn.get<TokenRecord>(key);
-        if (token) await txn.delete([key, this.expiryKey(token.expiresAt, key)]);
+        const records = await txn.get<TokenRecord | RefreshTokenRecord>([accessKey, refreshKey]);
+        for (const key of [accessKey, refreshKey]) {
+          const record = records.get(key);
+          if (record) {
+            const keys = [key, this.expiryKey(record.expiresAt, key)];
+            if (record.grantId !== undefined) {
+              const grantKey = `grant:${record.grantId}`;
+              const membersKey = `grant-members:${record.grantId}`;
+              const [grant, members] = await Promise.all([txn.get<GrantRecord>(grantKey), txn.get<GrantMembersRecord>(membersKey)]);
+              if (members) for (const [memberKey, expiresAt] of Object.entries(members.members)) keys.push(memberKey, this.expiryKey(expiresAt, memberKey));
+              keys.push(membersKey);
+              if (grant) keys.push(grantKey, this.expiryKey(grant.expiresAt, grantKey));
+            }
+            await txn.delete(keys);
+            break;
+          }
+        }
       });
       await this.scheduleCleanup();
       return new Response(null, { status: 204 });
@@ -618,11 +714,33 @@ export class OAuthStore implements DurableObject {
     if (rate && rate.resetsAt <= Date.now()) await this.state.storage.delete("rate");
     const end = `expiry:${String(Date.now()).padStart(13, "0")}:\uffff`;
     const due = await this.state.storage.list<string>({ prefix: "expiry:", end });
-    const keys: string[] = [];
+    const keys = new Set<string>();
     let expiredDcr = 0;
-    for (const [expiryKey, recordKey] of due) { keys.push(expiryKey, recordKey); if (recordKey.startsWith("dcr:")) expiredDcr++; }
-    if (keys.length) await this.state.storage.transaction(async (txn) => {
-      await txn.delete(keys);
+    for (const [expiryKey, recordKey] of due) { keys.add(expiryKey); keys.add(recordKey); if (recordKey.startsWith("dcr:")) expiredDcr++; }
+    if (keys.size) await this.state.storage.transaction(async (txn) => {
+      const expiringGrants = [...due.values()].filter((recordKey) => recordKey.startsWith("grant:"));
+      for (const grantKey of expiringGrants) {
+        const grantId = grantKey.slice(6);
+        const membersKey = `grant-members:${grantId}`;
+        const members = await txn.get<GrantMembersRecord>(membersKey);
+        if (members) for (const [memberKey, expiresAt] of Object.entries(members.members)) {
+          keys.add(memberKey);
+          keys.add(this.expiryKey(expiresAt, memberKey));
+        }
+        keys.add(membersKey);
+      }
+      const dueMembers = [...due.values()].filter((recordKey) => recordKey.startsWith("token:") || recordKey.startsWith("refresh:"));
+      for (const memberKey of dueMembers) {
+        const member = await txn.get<TokenRecord | RefreshTokenRecord>(memberKey);
+        if (!member?.grantId || expiringGrants.includes(`grant:${member.grantId}`)) continue;
+        const membersKey = `grant-members:${member.grantId}`;
+        const members = await txn.get<GrantMembersRecord>(membersKey);
+        if (members && memberKey in members.members) {
+          delete members.members[memberKey];
+          await txn.put(membersKey, members);
+        }
+      }
+      await txn.delete([...keys]);
       if (expiredDcr) await txn.put("dcr:count", Math.max(0, (await txn.get<number>("dcr:count") ?? 0) - expiredDcr));
     });
     await this.scheduleCleanup();
