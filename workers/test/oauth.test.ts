@@ -17,6 +17,10 @@ async function challenge(value = verifier): Promise<string> {
   return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))));
 }
 
+async function storageHash(value: string): Promise<string> {
+  return base64Url(new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))));
+}
+
 function authorizationUrl(overrides: Record<string, string> = {}): string {
   const params = new URLSearchParams({
     response_type: "code",
@@ -74,6 +78,40 @@ async function exchange(code: string, overrides: Record<string, string> = {}): P
   });
 }
 
+async function refresh(refreshToken: string, overrides: Record<string, string | undefined> = {}): Promise<Response> {
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    client_id: clientId,
+    resource: "https://worker.test/mcp",
+  });
+  for (const [name, value] of Object.entries(overrides)) {
+    if (value === undefined) body.delete(name);
+    else body.set(name, value);
+  }
+  return SELF.fetch("https://worker.test/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body,
+  });
+}
+
+async function revoke(token: string): Promise<Response> {
+  return SELF.fetch("https://worker.test/revoke", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({ token }),
+  });
+}
+
+async function authorizeMcp(accessToken: string): Promise<Response> {
+  return SELF.fetch("https://worker.test/mcp", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${accessToken}`, "MCP-Protocol-Version": "2024-11-05" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+  });
+}
+
 describe("hardened OAuth worker", () => {
   beforeAll(() => fetchMock.activate());
   afterEach(() => vi.useRealTimers());
@@ -105,7 +143,9 @@ describe("hardened OAuth worker", () => {
     expect(await resource.json()).toEqual({ resource: "https://worker.test/mcp", authorization_servers: ["https://worker.test"], scopes_supported: ["mcp"] });
     const server = await (await SELF.fetch("https://untrusted-host.test/.well-known/oauth-authorization-server")).json<Record<string, unknown>>();
     expect(server).toMatchObject({ issuer: "https://worker.test", authorization_endpoint: "https://worker.test/authorize", token_endpoint: "https://worker.test/token", registration_endpoint: "https://worker.test/register", client_id_metadata_document_supported: true });
+    expect(server.revocation_endpoint).toBe("https://worker.test/revoke");
     expect(server.code_challenge_methods_supported).toEqual(["S256"]);
+    expect(server.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
     const unauthorized = await SELF.fetch("https://worker.test/mcp", { method: "POST", body: "{}" });
     expect(unauthorized.headers.get("www-authenticate")).toBe('Bearer resource_metadata="https://worker.test/.well-known/oauth-protected-resource/mcp", scope="mcp"');
   });
@@ -241,7 +281,204 @@ describe("hardened OAuth worker", () => {
   it("accepts Hermes public-client registration metadata with refresh_token", async () => {
     const response = await SELF.fetch("https://worker.test/register", { method: "POST", headers: { "Content-Type": "application/json", "CF-Connecting-IP": crypto.randomUUID() }, body: JSON.stringify({ redirect_uris: ["http://127.0.0.1:54321/callback"], token_endpoint_auth_method: "none", grant_types: ["authorization_code", "refresh_token"], response_types: ["code"] }) });
     expect(response.status).toBe(201);
-    expect(await response.json()).toMatchObject({ grant_types: ["authorization_code"], response_types: ["code"], token_endpoint_auth_method: "none" });
+    expect(await response.json()).toMatchObject({ grant_types: ["authorization_code", "refresh_token"], response_types: ["code"], token_endpoint_auth_method: "none" });
+  });
+
+  it("rotates refresh tokens and authorizes MCP with the refreshed access token", async () => {
+    const initial = await exchange(await issueCode());
+    expect(initial.status).toBe(200);
+    const first = await initial.json<{ access_token: string; refresh_token: string }>();
+    expect(first.refresh_token).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const stored = await runInDurableObject(stub, async (_instance, state) => JSON.stringify([...(await state.storage.list()).entries()]));
+    expect(stored).not.toContain(first.refresh_token);
+
+    const rotated = await refresh(first.refresh_token);
+    expect(rotated.status).toBe(200);
+    const second = await rotated.json<{ access_token: string; refresh_token: string }>();
+    expect(second.access_token).not.toBe(first.access_token);
+    expect(second.refresh_token).not.toBe(first.refresh_token);
+    expect((await refresh(first.refresh_token)).status).toBe(400);
+
+    const mcp = await SELF.fetch("https://worker.test/mcp", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${second.access_token}`, "MCP-Protocol-Version": "2024-11-05" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }),
+    });
+    expect(mcp.status).toBe(200);
+  });
+
+  it("refreshes without resource and does not extend the original absolute expiry", async () => {
+    const first = await (await exchange(await issueCode())).json<{ refresh_token: string }>();
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const originalExpiry = await runInDurableObject(stub, async (_instance, state) => {
+      const records = await state.storage.list<{ expiresAt: number }>({ prefix: "refresh:" });
+      return [...records.values()][0]?.expiresAt;
+    });
+
+    const rotated = await refresh(first.refresh_token, { resource: undefined });
+    expect(rotated.status).toBe(200);
+    const rotatedExpiry = await runInDurableObject(stub, async (_instance, state) => {
+      const records = await state.storage.list<{ expiresAt: number }>({ prefix: "refresh:" });
+      expect(records.size).toBe(1);
+      return [...records.values()][0]?.expiresAt;
+    });
+    expect(rotatedExpiry).toBe(originalExpiry);
+  });
+
+  it("caps refreshed access tokens at the original absolute refresh expiry", async () => {
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const first = await (await exchange(await issueCode())).json<{ refresh_token: string }>();
+    const refreshKey = `refresh:${await storageHash(first.refresh_token)}`;
+    const deadline = Date.now() + 30_000;
+    await runInDurableObject(stub, async (_instance, state) => {
+      await state.storage.transaction(async (txn) => {
+        const current = await txn.get<{ expiresAt: number; grantId: string }>(refreshKey);
+        expect(current).toBeDefined();
+        const grantKey = `grant:${current!.grantId}`;
+        const membersKey = `grant-members:${current!.grantId}`;
+        const grant = await txn.get<{ expiresAt: number }>(grantKey);
+        const members = await txn.get<{ expiresAt: number; members: Record<string, number> }>(membersKey);
+        expect(grant).toBeDefined();
+        expect(members).toBeDefined();
+        await txn.delete([
+          `expiry:${String(current!.expiresAt).padStart(13, "0")}:${refreshKey}`,
+          `expiry:${String(grant!.expiresAt).padStart(13, "0")}:${grantKey}`,
+        ]);
+        members!.expiresAt = deadline;
+        members!.members[refreshKey] = deadline;
+        await txn.put({
+          [refreshKey]: { ...current!, expiresAt: deadline },
+          [`expiry:${String(deadline).padStart(13, "0")}:${refreshKey}`]: refreshKey,
+          [grantKey]: { expiresAt: deadline },
+          [`expiry:${String(deadline).padStart(13, "0")}:${grantKey}`]: grantKey,
+          [membersKey]: members!,
+        });
+      });
+    });
+
+    const response = await refresh(first.refresh_token);
+    expect(response.status).toBe(200);
+    const rotated = await response.json<{ access_token: string; expires_in: number }>();
+    expect(rotated.expires_in).toBeGreaterThan(0);
+    expect(rotated.expires_in).toBeLessThanOrEqual(30);
+    const accessKey = `token:${await storageHash(rotated.access_token)}`;
+    const accessExpiry = await runInDurableObject(stub, async (_instance, state) =>
+      (await state.storage.get<{ expiresAt: number }>(accessKey))?.expiresAt);
+    expect(accessExpiry).toBeDefined();
+    expect(accessExpiry).toBeLessThanOrEqual(deadline);
+    expect((await authorizeMcp(rotated.access_token)).status).toBe(200);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(deadline);
+      expect((await authorizeMcp(rotated.access_token)).status).toBe(401);
+      await runInDurableObject(stub, async (instance, state) => {
+        await instance.alarm();
+        await state.storage.deleteAlarm();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("revoking a refresh token invalidates its paired access token", async () => {
+    const pair = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    expect((await authorizeMcp(pair.access_token)).status).toBe(200);
+    expect((await revoke(pair.refresh_token)).status).toBe(200);
+    expect((await authorizeMcp(pair.access_token)).status).toBe(401);
+  });
+
+  it("revoking an access token invalidates its paired refresh token", async () => {
+    const pair = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    expect((await revoke(pair.access_token)).status).toBe(200);
+    expect((await refresh(pair.refresh_token)).status).toBe(400);
+  });
+
+  it("revoking an earlier access token invalidates the grant after refresh rotation", async () => {
+    const first = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    const second = await (await refresh(first.refresh_token)).json<{ access_token: string; refresh_token: string }>();
+    expect((await authorizeMcp(second.access_token)).status).toBe(200);
+
+    expect((await revoke(first.access_token)).status).toBe(200);
+    expect((await authorizeMcp(second.access_token)).status).toBe(401);
+    expect((await refresh(second.refresh_token)).status).toBe(400);
+
+    const otherFirst = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    const otherSecond = await (await refresh(otherFirst.refresh_token)).json<{ access_token: string; refresh_token: string }>();
+    expect((await revoke(otherSecond.refresh_token)).status).toBe(200);
+    expect((await authorizeMcp(otherFirst.access_token)).status).toBe(401);
+    expect((await authorizeMcp(otherSecond.access_token)).status).toBe(401);
+  });
+
+  it("physically removes every indexed member of a rotated grant without affecting another grant", async () => {
+    fetchMock.get("https://api.example.invalid")
+      .intercept({ path: "/functions/v1/mcp-api/projects", method: "GET" })
+      .reply(200, { projects: [] });
+    const first = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    const rotated = await (await refresh(first.refresh_token)).json<{ access_token: string; refresh_token: string }>();
+    const other = await (await exchange(await issueCode())).json<{ access_token: string; refresh_token: string }>();
+    const revokedAccessKey = `token:${await storageHash(first.access_token)}`;
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const revokedGrant = await runInDurableObject(stub, async (_instance, state) => {
+      const grantId = (await state.storage.get<{ grantId: string }>(revokedAccessKey))!.grantId;
+      const index = await state.storage.get<{ members: Record<string, number> }>(`grant-members:${grantId}`);
+      return { grantId, memberKeys: Object.keys(index!.members) };
+    });
+
+    expect((await revoke(first.access_token)).status).toBe(200);
+
+    const remaining = await runInDurableObject(stub, async (_instance, state) => [...(await state.storage.list()).entries()]);
+    expect(remaining.filter(([key, value]) =>
+      key === `grant:${revokedGrant.grantId}` ||
+      key === `grant-members:${revokedGrant.grantId}` ||
+      (key.startsWith("expiry:") && typeof value === "string" && (
+        value === `grant:${revokedGrant.grantId}` || revokedGrant.memberKeys.includes(value)
+      )) ||
+      revokedGrant.memberKeys.includes(key) ||
+      ((key.startsWith("token:") || key.startsWith("refresh:")) && typeof value === "object" && value !== null && "grantId" in value && value.grantId === revokedGrant.grantId)
+    )).toEqual([]);
+    expect(JSON.stringify(remaining)).not.toContain(rotated.refresh_token);
+    expect((await authorizeMcp(rotated.access_token)).status).toBe(401);
+    expect((await refresh(rotated.refresh_token)).status).toBe(400);
+    expect((await authorizeMcp(other.access_token)).status).toBe(200);
+    expect((await refresh(other.refresh_token)).status).toBe(200);
+  });
+
+  it("rejects malformed, mismatched, expired, and revoked refresh grants", async () => {
+    const issueRefresh = async () => (await (await exchange(await issueCode())).json<{ refresh_token: string }>()).refresh_token;
+    const mismatchedClient = await issueRefresh();
+    expect((await refresh(mismatchedClient, { client_id: "other-client" })).status).toBe(400);
+    expect((await refresh(mismatchedClient)).status).toBe(200);
+
+    const mismatchedResource = await issueRefresh();
+    expect((await refresh(mismatchedResource, { resource: "https://wrong.example/mcp" })).status).toBe(400);
+    expect((await refresh(mismatchedResource)).status).toBe(200);
+
+    for (const body of [
+      new URLSearchParams({ grant_type: "refresh_token", client_id: clientId, resource: "https://worker.test/mcp" }),
+      new URLSearchParams({ grant_type: "refresh_token", refresh_token: "x".repeat(43), client_id: clientId, resource: "https://worker.test/mcp", code: "incompatible" }),
+      new URLSearchParams({ grant_type: "refresh_token", refresh_token: "x".repeat(43), client_id: clientId, resource: "https://worker.test/mcp", scope: "other" }),
+    ]) expect((await SELF.fetch("https://worker.test/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body })).status).toBe(400);
+    const duplicate = new URLSearchParams({ grant_type: "refresh_token", refresh_token: "x".repeat(43), client_id: clientId, resource: "https://worker.test/mcp" });
+    duplicate.append("refresh_token", "y".repeat(43));
+    expect((await SELF.fetch("https://worker.test/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: duplicate })).status).toBe(400);
+    for (const body of [new URLSearchParams(), new URLSearchParams({ grant_type: "refresh_token" })]) {
+      if (body.has("grant_type")) body.append("grant_type", "authorization_code");
+      const response = await SELF.fetch("https://worker.test/token", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: "invalid_request" });
+    }
+
+    const expired = await issueRefresh();
+    vi.useFakeTimers();
+    vi.setSystemTime(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    expect((await refresh(expired)).status).toBe(400);
+    vi.useRealTimers();
+
+    const revoked = await issueRefresh();
+    expect((await SELF.fetch("https://worker.test/revoke", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token: revoked }) })).status).toBe(200);
+    expect((await refresh(revoked)).status).toBe(400);
   });
 
   it("allows a Hermes consent POST to redirect to its registered loopback callback", async () => {
@@ -455,6 +692,30 @@ describe("hardened OAuth worker", () => {
     expect(storedKeys.some((key) => key.startsWith("token:") || key.includes(":token:"))).toBe(false);
   });
 
+  it("authorizes and directly revokes an unexpired legacy token without a grantId", async () => {
+    const issued = await (await exchange(await issueCode())).json<{ access_token: string }>();
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const sourceKey = `token:${await storageHash(issued.access_token)}`;
+    const legacyToken = "legacy-token-record-without-grant-id";
+    const legacyKey = `token:${await storageHash(legacyToken)}`;
+    await runInDurableObject(stub, async (_instance, state) => {
+      const source = await state.storage.get<Record<string, unknown>>(sourceKey);
+      const expiresAt = Date.now() + 60_000;
+      const { grantId: _grantId, ...legacy } = source!;
+      await state.storage.put({
+        [legacyKey]: { ...legacy, expiresAt },
+        [`expiry:${String(expiresAt).padStart(13, "0")}:${legacyKey}`]: legacyKey,
+      });
+    });
+
+    expect((await authorizeMcp(legacyToken)).status).toBe(200);
+    expect((await revoke(legacyToken)).status).toBe(200);
+    expect((await authorizeMcp(legacyToken)).status).toBe(401);
+    const legacyKeys = await runInDurableObject(stub, async (_instance, state) =>
+      [...(await state.storage.list()).keys()].filter((key) => key === legacyKey || key.endsWith(`:${legacyKey}`)));
+    expect(legacyKeys).toEqual([]);
+  });
+
   it("rejects expired codes and access tokens", async () => {
     const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
     const expiredCode = "e".repeat(43);
@@ -482,7 +743,32 @@ describe("hardened OAuth worker", () => {
     vi.useFakeTimers();
     vi.setSystemTime(Date.now() + 3_601_000);
     expect(await runDurableObjectAlarm(stub)).toBe(true);
-    const remainingKeys = await runInDurableObject(stub, async (_instance, state) => [...(await state.storage.list()).keys()]);
-    expect(remainingKeys.some((key) => key.startsWith("token:") || key.startsWith("code:") || key.startsWith("expiry:"))).toBe(false);
+    let remainingKeys = await runInDurableObject(stub, async (_instance, state) => [...(await state.storage.list()).keys()]);
+    expect(remainingKeys.some((key) => key.startsWith("token:") || key.startsWith("code:"))).toBe(false);
+    expect(remainingKeys.some((key) => key.startsWith("refresh:"))).toBe(true);
+    expect(remainingKeys.some((key) => key.startsWith("grant:"))).toBe(true);
+    vi.setSystemTime(Date.now() + 31 * 24 * 60 * 60 * 1000);
+    expect(await runDurableObjectAlarm(stub)).toBe(true);
+    remainingKeys = await runInDurableObject(stub, async (_instance, state) => [...(await state.storage.list()).keys()]);
+    expect(remainingKeys.some((key) => key.startsWith("refresh:") || key.startsWith("grant:") || key.startsWith("grant-members:") || key.startsWith("expiry:"))).toBe(false);
+  });
+
+  it("cleans each grant only at its own absolute expiry", async () => {
+    const now = Date.now();
+    const stub = env.OAUTH_STORE.get(env.OAUTH_STORE.idFromName("oauth"));
+    const dueAt = now - 1;
+    const laterAt = now + 24 * 60 * 60 * 1000;
+    const expiryKey = (expiresAt: number, recordKey: string) => `expiry:${String(expiresAt).padStart(13, "0")}:${recordKey}`;
+    const grantKeys = await runInDurableObject(stub, async (instance, state) => {
+      await state.storage.put({
+        "grant:due": { expiresAt: dueAt },
+        [expiryKey(dueAt, "grant:due")]: "grant:due",
+        "grant:later": { expiresAt: laterAt },
+        [expiryKey(laterAt, "grant:later")]: "grant:later",
+      });
+      await instance.alarm();
+      return [...(await state.storage.list({ prefix: "grant:" })).keys()];
+    });
+    expect(grantKeys).toEqual(["grant:later"]);
   });
 });
