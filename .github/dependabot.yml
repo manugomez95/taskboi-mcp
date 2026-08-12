@@ -5,14 +5,16 @@ updates:
     schedule:
       interval: weekly
     groups:
-      root-dependencies:
+      root-compatible:
         patterns:
           - "*"
+        update-types: ["minor", "patch"]
   - package-ecosystem: npm
     directory: /workers
     schedule:
       interval: weekly
     groups:
-      worker-dependencies:
+      worker-compatible:
         patterns:
           - "*"
+        update-types: ["minor", "patch"]
