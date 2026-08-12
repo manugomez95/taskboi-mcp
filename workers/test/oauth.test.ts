@@ -1,11 +1,38 @@
-import { env, fetchMock, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { env, reset, runDurableObjectAlarm, runInDurableObject, SELF } from "cloudflare:test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { handleOAuth, validateOAuthConfiguration } from "../src/oauth";
 
 const redirectUri = "https://client.example/callback";
 const clientId = "test-client";
 const verifier = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~";
 let nextIssueIp = 1;
+
+type MockReply = { origin: string; path: string; method: string; status: number; body: unknown; headers?: Record<string, string> };
+let mockReplies: MockReply[] = [];
+
+const fetchMock = {
+  disableNetConnect() {},
+  get(origin: string) {
+    return {
+      intercept({ path, method = "GET" }: { path: string; method?: string }) {
+        return {
+          reply(status: number, body: unknown, options?: { headers?: Record<string, string> }) {
+            mockReplies.push({ origin, path, method, status, body, headers: options?.headers });
+          },
+        };
+      },
+    };
+  },
+};
+
+async function mockedFetch(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const request = new Request(input, init);
+  const url = new URL(request.url);
+  const reply = mockReplies.find((candidate) => candidate.origin === url.origin && candidate.path === `${url.pathname}${url.search}` && candidate.method === request.method);
+  if (!reply) throw new Error(`Unmocked fetch: ${request.method} ${request.url}`);
+  const body = typeof reply.body === "object" && reply.body !== null ? JSON.stringify(reply.body) : String(reply.body);
+  return new Response(body, { status: reply.status, headers: reply.headers });
+}
 
 function base64Url(bytes: Uint8Array): string {
   let value = "";
@@ -113,9 +140,14 @@ async function authorizeMcp(accessToken: string): Promise<Response> {
 }
 
 describe("hardened OAuth worker", () => {
-  beforeAll(() => fetchMock.activate());
-  afterEach(() => vi.useRealTimers());
+  afterEach(async () => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+    await reset();
+  });
   beforeEach(() => {
+    mockReplies = [];
+    vi.stubGlobal("fetch", mockedFetch);
     fetchMock.disableNetConnect();
     fetchMock.get("https://api.example.invalid")
       .intercept({ path: "/functions/v1/mcp-api/projects", method: "GET" })
